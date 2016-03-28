@@ -5,7 +5,7 @@ use std::str;
 use std::fmt;
 use std::net::ToSocketAddrs;
 use std::io::prelude::*;
-use std::io::BufReader;
+use std::io::BufReader; 
 use std::net::TcpStream;
 
 use nom::IResult;
@@ -76,18 +76,6 @@ named!(deserialize<Message>, chain!(
         command: c.to_owned(),
         parameters: pa.into_iter().map(|p| p.to_owned()).collect(),
     } } ));
-    
-struct MessageIter {
-    iter: Box<Iterator<Item=Message>>
-}
-
-impl Iterator for MessageIter {
-    type Item = Message;
-
-    fn next(&mut self) -> Option<Message> {
-        return self.iter.next();
-    }
-}
 
 struct IRCConnection {
     stream: TcpStream,
@@ -102,7 +90,7 @@ impl IRCConnection {
         }
     }
     
-    fn messages(&self) -> MessageIter {
+    fn messages(&self) -> Box<Iterator<Item=Message>> {
         let reader = BufReader::new(self.stream.try_clone().expect("Could not clone"));
         
         let iter = reader.lines().map(|result| {
@@ -115,7 +103,7 @@ impl IRCConnection {
             }
         });
         
-        MessageIter{ iter: Box::new(iter) }
+        Box::new(iter)
     }
     
     fn send(&self, msg: &Message) {

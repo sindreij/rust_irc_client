@@ -1,16 +1,14 @@
-extern crate regex;
 #[macro_use]
 extern crate nom;
 
-
-use nom::{IResult,digit};
-use nom::IResult::*;
 use std::str;
-
+use std::fmt;
+use std::net::ToSocketAddrs;
 use std::io::prelude::*;
 use std::io::BufReader;
 use std::net::TcpStream;
-use regex::Regex;
+
+use nom::IResult;
 
 #[derive(Debug)]
 struct Message {
@@ -30,7 +28,7 @@ impl Message {
 
     fn serialize(&self) -> String {
         let mut res = String::new();
-        
+
         if let Some(ref prefix) = self.prefix {
             res.push_str(prefix);
             res.push(' ');
@@ -57,6 +55,12 @@ impl Message {
     }
 }
 
+impl fmt::Display for Message {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}: {}", self.command, self.parameters.join(" "))
+    }
+}
+
 named!(prefix<&str>, map_res!(delimited!(char!(':'), is_not!(" "), char!(' ')), str::from_utf8));
 named!(command<&str>, map_res!(is_not!(" "), str::from_utf8));
 named!(parameter, alt!(preceded!(char!(':'), nom::rest) | is_not!(" ")));
@@ -68,9 +72,9 @@ named!(deserialize<Message>, chain!(
     char!(' ') ~
     pa: parameters
     , || { Message {
-        prefix: pr.map(|p| p.to_string()),
-        command: c.to_string(),
-        parameters: pa.into_iter().map(|p| p.to_string()).collect(),
+        prefix: pr.map(|p| p.to_owned()),
+        command: c.to_owned(),
+        parameters: pa.into_iter().map(|p| p.to_owned()).collect(),
     } } ));
     
 struct MessageIter {
@@ -90,8 +94,8 @@ struct IRCConnection {
 }
 
 impl IRCConnection {
-    fn connect() -> Self {
-        let mut stream = TcpStream::connect("chat.freenode.net:6667").unwrap();
+    fn connect<A: ToSocketAddrs>(addr: A) -> Self {
+        let stream = TcpStream::connect(addr).unwrap();
         
         IRCConnection {
             stream: stream,
@@ -105,9 +109,9 @@ impl IRCConnection {
             let line = result.expect("No Content");
             let result = deserialize(line.as_bytes());
             match result {
-                Done(rest, res) => res,
-                Error(err) => panic!("{}", err),
-                Incomplete(someting) => panic!("Incomplete: {:?}", someting),
+                IResult::Done(_, res) => res,
+                IResult::Error(err) => panic!("{}", err),
+                IResult::Incomplete(someting) => panic!("Incomplete: {:?}", someting),
             }
         });
         
@@ -115,37 +119,31 @@ impl IRCConnection {
     }
     
     fn send(&self, msg: &Message) {
-        print_message(msg);
+        println!("> {}", msg);
         write!(&self.stream, "{}\r\n", msg.serialize()).expect("Could not write!");
     }
 }
 
-fn main() {
-    let mut conn = IRCConnection::connect();
-    
-    conn.send(&Message::new("NICK", &["sindreij_"]));
-    conn.send(&Message::new("USER", &["sindreij_", "0", "*", "sindreij_"]));
-    
-    for msg in conn.messages() {
-        incoming(msg, &conn);
+fn incoming(msg: Message, conn: &IRCConnection) {
+    println!("< {}", msg);
+    match msg.command.as_str() {
+        "PING" => {
+            let params:Vec<_> = msg.parameters.iter().map(|s| s.as_str()).collect();
+            conn.send(&Message::new("PONG", &params));
+        },
+        _ => {}
     }
 }
 
-fn print_message(msg: &Message) {
-    println!("{}: {}", msg.command, msg.parameters.join(" "));
-}
-
-fn incoming(msg: Message, conn: &IRCConnection) {
-    print_message(&msg);
-    match msg.command.as_str() {
-        "PING" => {
-            println!("Got pinged");
-            conn.send(&Message{ 
-                prefix: None, 
-                command: "PONG".to_string(), 
-                parameters: msg.parameters
-            });
-        },
-        _ => {}
+fn main() {
+    let input = "chat.freenode.net:6667\nrhenium\nrhenium\nrhenium";
+    let parts:Vec<_> = input.lines().collect();
+    let conn = IRCConnection::connect(parts[0]);
+    
+    conn.send(&Message::new("NICK", &[parts[1]]));
+    conn.send(&Message::new("USER", &[parts[2], "0", "*", parts[3]]));
+    
+    for msg in conn.messages() {
+        incoming(msg, &conn);
     }
 }

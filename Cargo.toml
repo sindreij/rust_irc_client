@@ -4,8 +4,4 @@ version = "0.1.0"
 authors = ["Sindre Johansen <sindre@iterate.no>"]
 
 [dependencies]
-regex = "0.1.58"
-
-[dependencies.nom]
-version = "~1.2.2"
-features = ["regexp"]
+nom = "~1.2.2"

@@ -5,3 +5,4 @@ authors = ["Sindre Johansen <sindre@iterate.no>"]
 
 [dependencies]
 nom = "~1.2.2"
+rand = "0.3.14"

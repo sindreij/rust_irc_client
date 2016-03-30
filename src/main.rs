@@ -1,5 +1,6 @@
 #[macro_use]
 extern crate nom;
+extern crate rand;
 
 use std::str;
 use std::fmt;
@@ -7,6 +8,7 @@ use std::net::ToSocketAddrs;
 use std::io::prelude::*;
 use std::io::BufReader;
 use std::net::TcpStream;
+use rand::distributions::{IndependentSample, Range};
 
 use nom::IResult;
 
@@ -24,6 +26,13 @@ impl Message {
             prefix: None,
             command: command.to_owned(),
             parameters: params.into_iter().map(|s| s.into()).collect(),
+        }
+    }
+
+    fn nickname<'a>(&'a self) -> Option<&'a str> {
+        match &self.prefix {
+            &Some(ref prefix) => prefix.split('!').next(),
+            &None => None
         }
     }
 
@@ -112,13 +121,22 @@ struct IRCConnection {
 }
 
 impl IRCConnection {
-    fn connect<A: ToSocketAddrs>(addr: A, nick: &str) -> Self {
+    fn connect<A: ToSocketAddrs>(addr: A) -> Self {
         let stream = TcpStream::connect(addr).unwrap();
 
         IRCConnection {
             stream: stream,
-            nick: nick.to_owned(),
+            nick: "".to_owned(),
         }
+    }
+
+    fn set_nick(&mut self, nick: &str) {
+        self.nick = nick.to_owned();
+        self.send(&Message::new("NICK", &[nick]));
+    }
+
+    fn set_user(&self, username: &str, realname: &str) {
+        self.send(&Message::new("USER", &[username, "0", "*", realname]));
     }
 
     fn messages(&self) -> Box<Iterator<Item=Message>> {
@@ -143,61 +161,112 @@ impl IRCConnection {
     }
 }
 
-fn react_to_text(chan: &str, text: &str, conn: &IRCConnection) {
-    if text == "Hello World!" {
-        conn.send(&Message::new("PRIVMSG", &[chan, "Hello World"]));
-    }
-
-    let parsed = deserialize_text(text.as_bytes());
-
-    if let IResult::Done(_, parsed) = parsed {
-        if let Some(mention) = parsed.mention {
-            if mention == conn.nick {
-                match parsed.command {
-                    "sum" => {
-                        let sum = parsed.parameters.iter().filter_map(|n| n.parse::<i64>().ok())
-                                  .fold(0, |acc, x| acc + x);
-                        conn.send(&Message::new("PRIVMSG", &[chan.to_owned(), format!("The sum is {}", sum)]));
-                    },
-                    "echo" => {
-                        let echo = parsed.parameters.join(" ");
-                        conn.send(&Message::new("PRIVMSG", &[chan.to_owned(), format!("{}", echo)]));
-                    },
-                    _ => {},
-                }
+fn message_from_command(reply_chan: &str, parsed: ParsedText) -> Option<Message> {
+    match parsed.command {
+        "sum" => {
+            let sum = parsed.parameters.iter().filter_map(|n| n.parse::<i64>().ok())
+                      .fold(0, |acc, x| acc + x);
+            Some(Message::new("PRIVMSG", &[reply_chan.to_owned(), format!("The sum is {}", sum)]))
+        },
+        "echo" => {
+            let echo = parsed.parameters.join(" ");
+            Some(Message::new("PRIVMSG", &[reply_chan.to_owned(), format!("{}", echo)]))
+        },
+        "random" => {
+            if parsed.parameters.len() != 1 {
+                return Some(Message::new("PRIVMSG", &[reply_chan.to_owned(), format!("Random take one parameter")]));
             }
-        }
+            let mut rng = rand::thread_rng();
+            let max:i64 = match parsed.parameters[0].parse() {
+                Ok(num) => num,
+                Err(_) => return Some(Message::new("PRIVMSG", &[reply_chan.to_owned(), format!("{} is not a number", parsed.parameters[0])])),
+            };
+            if max < 0 {
+                return Some(Message::new("PRIVMSG", &[reply_chan.to_owned(), format!("{} is below 0", max)]));
+            }
+            let random:i64 = Range::new(0, max+1).ind_sample(&mut rng);
+
+            Some(Message::new("PRIVMSG", &[reply_chan.to_owned(), format!("{}", random)]))
+        },
+        _ => None,
     }
 }
 
-fn incoming(msg: Message, conn: &IRCConnection) {
-    println!("< {}", msg);
-    match msg.command.as_str() {
-        "PING" => {
-            let params:Vec<_> = msg.parameters.iter().map(|s| s.as_str()).collect();
-            conn.send(&Message::new("PONG", &params));
-        },
-        "376" => {
-            conn.send(&Message::new("JOIN", &["#sindreij_bottest"]));
-        },
-        "PRIVMSG" => {
-            let channel = &msg.parameters[0];
-            let text = &msg.parameters[1];
-            react_to_text(channel, text, conn);
+struct IRCApp {
+    conn: IRCConnection,
+    channels: String,
+    join_message: String,
+}
+
+impl IRCApp {
+    fn react_to_text(&self, from: Option<&str>, chan: &str, text: &str) {
+        let parsed = deserialize_text(text.as_bytes());
+        let msg = if let IResult::Done(_, parsed) = parsed {
+            match (parsed.mention, from) {
+                (_, Some(from)) if chan == self.conn.nick => {
+                    message_from_command(from, parsed)
+                }
+                (Some(mention), _) if mention == self.conn.nick => {
+                    message_from_command(chan, parsed)
+                },
+                _ => None
+            }
+        } else {
+            None
+        };
+
+        if let Some(msg) = msg {
+            self.conn.send(&msg);
+        };
+    }
+
+    fn incoming(&self, msg: Message) {
+        println!("< {}", msg);
+        match msg.command.as_str() {
+            "PING" => {
+                let params:Vec<_> = msg.parameters.iter().map(|s| s.as_str()).collect();
+                self.conn.send(&Message::new("PONG", &params));
+            },
+            "376" => {
+                self.conn.send(&Message::new("JOIN", &[self.channels.as_str()]));
+            },
+            "PRIVMSG" => {
+                let channel = &msg.parameters[0];
+                let text = &msg.parameters[1];
+                self.react_to_text(msg.nickname(), channel, text);
+            },
+            "JOIN" => {
+                if let Some(nick) = msg.nickname() {
+                    if nick == self.conn.nick {
+                        for chan in (&msg.parameters[0]).split(',') {
+                            self.conn.send(&Message::new("PRIVMSG", &[chan, &self.join_message]));
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
-        _ => {}
+    }
+
+    fn run(&self) {
+        for msg in self.conn.messages() {
+            self.incoming(msg);
+        }
     }
 }
 
 fn main() {
-    let input = "chat.freenode.net:6667\nrhenium\nrhenium\nrhenium";
+    let input = "chat.freenode.net:6667\nrhenium\nrhenium\nrhenium\n#botters-test,#rhenium-bottest\nHello World!!!";
     let parts:Vec<_> = input.lines().collect();
-    let conn = IRCConnection::connect(parts[0], parts[1]);
+    let mut conn = IRCConnection::connect(parts[0]);
+    conn.set_nick(parts[1]);
+    conn.set_user(parts[2], parts[3]);
 
-    conn.send(&Message::new("NICK", &[parts[1]]));
-    conn.send(&Message::new("USER", &[parts[2], "0", "*", parts[3]]));
+    let app = IRCApp {
+        conn: conn,
+        channels: parts[4].to_owned(),
+        join_message: parts[5].to_owned(),
+    };
 
-    for msg in conn.messages() {
-        incoming(msg, &conn);
-    }
+    app.run();
 }
